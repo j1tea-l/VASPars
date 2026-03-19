@@ -11,7 +11,9 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 import openpyxl
 # ====== TESSERACT ======
-pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+DEFAULT_TESSERACT = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+if os.path.exists(DEFAULT_TESSERACT):
+    pytesseract.pytesseract.tesseract_cmd = DEFAULT_TESSERACT
 
 # ====== QUEUE ======
 log_queue = queue.Queue()
