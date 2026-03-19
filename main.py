@@ -54,29 +54,98 @@ def split_4(img):
 def ocr(img):
     return pytesseract.image_to_string(img, config="--psm 6 -l rus+eng").lower()
 
-def extract(text, keys):
+NUM_RE = re.compile(r"[-+]?\d+[.,]?\d*")
+
+def normalize_token(token):
+    token = token.lower()
+    translit = str.maketrans({
+        "a": "а", "c": "с", "e": "е", "k": "к", "m": "м", "h": "н", "o": "о", "p": "р", "t": "т", "x": "х",
+        "y": "у", "b": "в", "n": "п"
+    })
+    return token.translate(translit)
+
+def parse_num(text):
+    nums = NUM_RE.findall(text)
+    if not nums:
+        return None
+    return float(nums[-1].replace(",", "."))
+
+def extract_from_lines(text, keys):
     lines = text.split("\n")
+    norm_keys = [normalize_token(k) for k in keys]
     for i, line in enumerate(lines):
-        for k in keys:
-            if k in line:
-                nums = re.findall(r"[-+]?\d+[.,]?\d*", line)
-                if nums:
-                    return float(nums[-1].replace(",", "."))
-                if i+1 < len(lines):
-                    nums = re.findall(r"[-+]?\d+[.,]?\d*", lines[i+1])
-                    if nums:
-                        return float(nums[0].replace(",", "."))
+        norm_line = normalize_token(line)
+        if any(k in norm_line for k in norm_keys):
+            val = parse_num(line)
+            if val is not None:
+                return val
+            if i + 1 < len(lines):
+                val = parse_num(lines[i + 1])
+                if val is not None:
+                    return val
     return None
+
+def extract_from_layout(img, keys):
+    data = pytesseract.image_to_data(
+        img, config="--psm 6 -l rus+eng", output_type=pytesseract.Output.DICT
+    )
+    norm_keys = [normalize_token(k) for k in keys]
+    tokens = []
+    for i, raw in enumerate(data["text"]):
+        text = raw.strip()
+        conf = int(data["conf"][i]) if str(data["conf"][i]).lstrip("-").isdigit() else -1
+        if not text or conf < 0:
+            continue
+        tokens.append({
+            "text": text,
+            "norm": normalize_token(text),
+            "left": data["left"][i],
+            "top": data["top"][i],
+            "width": data["width"][i],
+            "height": data["height"][i],
+        })
+
+    for tk in tokens:
+        if not any(k in tk["norm"] for k in norm_keys):
+            continue
+        y = tk["top"]
+        x_right = tk["left"] + tk["width"]
+        candidates = []
+        for other in tokens:
+            if abs(other["top"] - y) > max(tk["height"], other["height"]) * 1.6:
+                continue
+            if other["left"] + other["width"] < x_right - 5:
+                continue
+            num = parse_num(other["text"])
+            if num is None:
+                continue
+            dist = abs(other["left"] - x_right)
+            candidates.append((dist, num))
+        if candidates:
+            candidates.sort(key=lambda item: item[0])
+            return candidates[0][1]
+    return None
+
+def extract_metric(img, keys):
+    text = ocr(img)
+    val = extract_from_lines(text, keys)
+    if val is not None:
+        return val
+    return extract_from_layout(img, keys)
 
 def parse_image(path):
     img = read_image_unicode(path)
     zones = split_4(img)
 
+    # Подготавливаем каждую зону отдельно, чтобы устойчиво работать
+    # при "плавающей" области с текстовыми значениями.
+    pre = {k: preprocess(v) for k, v in zones.items()}
+
     return {
-        "S21_amp_avg": extract(ocr(preprocess(zones["S21_amp"])), ["сред","cpea"]),
-        "S21_gvz_uneven": extract(ocr(preprocess(zones["S21_gvz"])), ["неравн","нераен"]),
-        "S11_avg": extract(ocr(preprocess(zones["S11"])), ["сред","cpea"]),
-        "S22_avg": extract(ocr(preprocess(zones["S22"])), ["сред","cpea"])
+        "S21_amp_avg": extract_metric(pre["S21_amp"], ["сред", "сред:", "cpea", "cped"]),
+        "S21_gvz_uneven": extract_metric(pre["S21_gvz"], ["неравн", "неравн:", "нераен", "неревн"]),
+        "S11_avg": extract_metric(pre["S11"], ["сред", "сред:", "cpea", "cped"]),
+        "S22_avg": extract_metric(pre["S22"], ["сред", "сред:", "cpea", "cped"])
     }
 
 # ====== META ======
