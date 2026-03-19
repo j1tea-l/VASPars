@@ -1,167 +1,217 @@
 import os
 import re
 import cv2
+import math
+import queue
+import threading
 import numpy as np
 import pandas as pd
-import easyocr
+import pytesseract
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+import openpyxl
+# ====== TESSERACT ======
+pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
-# ====== CONFIG ======
-INPUT_FOLDER = "C:/Users/Adm/Documents/Measure"
-OUTPUT_FILE = "result.xlsx"
-reader = easyocr.Reader(['ru', 'en'], gpu=True)
+# ====== QUEUE ======
+log_queue = queue.Queue()
 
+def log(msg):
+    log_queue.put(msg)
 
-# ====== IMAGE PREPROCESSING ======
+# ====== IMAGE ======
 def read_image_unicode(path):
     with open(path, 'rb') as f:
         data = np.frombuffer(f.read(), np.uint8)
-    img = cv2.imdecode(data, cv2.IMREAD_COLOR)
-    if img is None:
-        raise ValueError(f"Image not found or unreadable: {path}")
-    return img
+    return cv2.imdecode(data, cv2.IMREAD_COLOR)
 
-
-def preprocess_adaptive(img):
-    # Масштабируем под любую сторону >= 2000px
+def preprocess(img):
     h, w = img.shape[:2]
-    scale = max(1.0, 2000 / min(h, w))
-    img = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+    scale = max(1.5, 2500 / min(h, w))
+    img = cv2.resize(img, None, fx=scale, fy=scale)
 
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    # Adaptive threshold + инвертирование
-    th = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                               cv2.THRESH_BINARY, 15, 4)
-    th = cv2.bitwise_not(th)
-    # Морфология для очистки
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
-    clean = cv2.morphologyEx(th, cv2.MORPH_OPEN, kernel)
-    return clean
+    _, th = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY_INV)
 
+    kernel_h = cv2.getStructuringElement(cv2.MORPH_RECT, (50,1))
+    kernel_v = cv2.getStructuringElement(cv2.MORPH_RECT, (1,50))
 
-# ====== DYNAMIC OCR PARSING ======
-def extract_values_dynamic_anyres(img):
-    result = reader.readtext(img, detail=1)
-    data = {
-        "S21_amp_avg": None,
-        "S21_gvz_uneven": None,
-        "S11_avg": None,
-        "S22_avg": None
+    th = cv2.subtract(th, cv2.morphologyEx(th, cv2.MORPH_OPEN, kernel_h))
+    th = cv2.subtract(th, cv2.morphologyEx(th, cv2.MORPH_OPEN, kernel_v))
+
+    return th
+
+def split_4(img):
+    h, w = img.shape[:2]
+    return {
+        "S21_amp": img[0:h//2, 0:w//2],
+        "S21_gvz": img[0:h//2, w//2:w],
+        "S11": img[h//2:h, 0:w//2],
+        "S22": img[h//2:h, w//2:w]
     }
 
-    boxes = []
-    for bbox, text, conf in result:
-        boxes.append({"bbox": bbox, "text": text.lower(), "conf": conf})
+# ====== OCR ======
+def ocr(img):
+    return pytesseract.image_to_string(img, config="--psm 6 -l rus+eng").lower()
 
-    for item in boxes:
-        text_lower = item["text"].replace("cpea", "сред").replace("cped", "сред")
-        if "сред" in text_lower or "неравн" in text_lower:
-            # ищем ближайшую цифру
-            closest_value = None
-            min_dist = float('inf')
-            x1, y1 = np.mean(item["bbox"], axis=0)  # центр box
-            for other in boxes:
-                if other == item:
-                    continue
-                m = re.search(r"([-+]?\d+[.,]?\d*)", other["text"])
-                if m:
-                    ox, oy = np.mean(other["bbox"], axis=0)
-                    dist = np.sqrt((ox - x1) ** 2 + (oy - y1) ** 2)
-                    if dist < min_dist:
-                        min_dist = dist
-                        closest_value = float(m.group(1).replace(',', '.'))
+def extract(text, keys):
+    lines = text.split("\n")
+    for i, line in enumerate(lines):
+        for k in keys:
+            if k in line:
+                nums = re.findall(r"[-+]?\d+[.,]?\d*", line)
+                if nums:
+                    return float(nums[-1].replace(",", "."))
+                if i+1 < len(lines):
+                    nums = re.findall(r"[-+]?\d+[.,]?\d*", lines[i+1])
+                    if nums:
+                        return float(nums[0].replace(",", "."))
+    return None
 
-            if "сред" in text_lower:
-                if "s21" in text_lower and data["S21_amp_avg"] is None:
-                    data["S21_amp_avg"] = closest_value
-                elif "s11" in text_lower:
-                    data["S11_avg"] = closest_value
-                elif "s22" in text_lower:
-                    data["S22_avg"] = closest_value
-            elif "неравн" in text_lower:
-                if "s21" in text_lower:
-                    data["S21_gvz_uneven"] = closest_value
-    return data
-
-
-def parse_image_anyres(path):
+def parse_image(path):
     img = read_image_unicode(path)
-    pre = preprocess_adaptive(img)
-    data = extract_values_dynamic_anyres(pre)
-    return data
+    zones = split_4(img)
 
-
-# ====== METADATA PARSING (как раньше) ======
-def detect_path_from_folder(path):
-    path_lower = path.lower()
-    if "tx" in path_lower:
-        return "Tx"
-    if "rx" in path_lower:
-        return "Rx"
-    return None
-
-
-def detect_channel(name):
-    name = name.lower()
-    if "main" in name or "мейн" in name:
-        return "Main"
-    if "reserve" in name or "res" in name or "рез" in name:
-        return "Reserve"
-    return None
-
-
-def detect_attenuators(name):
-    nums = re.findall(r"\b(0|15|30)\b", name)
-    if len(nums) == 1:
-        return f"ATT{nums[0]}"
-    elif len(nums) >= 2:
-        return f"{nums[0]}-{nums[1]}"
-    return None
-
-
-def detect_band(name):
-    m = re.search(r"(\d{3,4})\D+(\d{3,4})", name)
-    if m:
-        return f"{m.group(1)}-{m.group(2)}"
-    return None
-
-
-def parse_metadata(filepath, filename):
-    name = os.path.splitext(filename)[0]
-    meta = {
-        "Device": os.path.basename(os.path.dirname(os.path.dirname(filepath))),
-        "Channel": detect_channel(name),
-        "Path": detect_path_from_folder(filepath),
-        "Config": detect_attenuators(name),
-        "Band": detect_band(name)
+    return {
+        "S21_amp_avg": extract(ocr(preprocess(zones["S21_amp"])), ["сред","cpea"]),
+        "S21_gvz_uneven": extract(ocr(preprocess(zones["S21_gvz"])), ["неравн","нераен"]),
+        "S11_avg": extract(ocr(preprocess(zones["S11"])), ["сред","cpea"]),
+        "S22_avg": extract(ocr(preprocess(zones["S22"])), ["сред","cpea"])
     }
-    return meta
 
+# ====== META ======
+def detect_path(p):
+    p=p.lower()
+    if "tx" in p: return "Tx"
+    if "rx" in p: return "Rx"
+    return None
 
-# ====== MAIN ======
-rows = []
-for root, dirs, files in os.walk(INPUT_FOLDER):
-    for file in files:
-        if file.lower().endswith((".png", ".jpg", ".jpeg")):
-            path = os.path.join(root, file)
-            try:
-                values = parse_image_anyres(path)
-                meta = parse_metadata(path, file)
-                row = {**meta, **values}
-                print(row)
-                rows.append(row)
-                print(f"Processed: {file}")
-            except Exception as e:
-                print(f"Error processing {file}: {e}")
+def detect_channel(n):
+    n=n.lower()
+    if "мейн" in n or "main" in n: return "Main"
+    if "рез" in n or "reserve" in n: return "Reserve"
+    return None
 
-# ====== SAVE ======
-df = pd.DataFrame(rows)
-columns = [
-    "Device", "Channel", "Path", "Config", "Band",
-    "S21_amp_avg", "S21_gvz_uneven", "S11_avg", "S22_avg"
-]
-for col in columns:
-    if col not in df.columns:
-        df[col] = None
-df = df[columns]
-df.to_excel(OUTPUT_FILE, index=False)
-print(f"Saved to {OUTPUT_FILE}")
+def detect_att(n):
+    nums = re.findall(r"\b(0|15|30)\b", n)
+    if len(nums)==1: return f"ATT{nums[0]}"
+    if len(nums)>=2: return f"{nums[0]}-{nums[1]}"
+    return None
+
+def detect_band(n):
+    m=re.search(r"(\d{3,4})\D+(\d{3,4})", n)
+    return f"{m.group(1)}-{m.group(2)}" if m else None
+
+def metadata(path,file):
+    return {
+        "Device": os.path.basename(os.path.dirname(os.path.dirname(path))),
+        "Channel": detect_channel(file),
+        "Path": detect_path(path),
+        "Config": detect_att(file),
+        "Band": detect_band(file)
+    }
+
+# ====== PHYSICS ======
+def expected(cfg):
+    if not cfg: return None
+    nums=list(map(int,re.findall(r"\d+",cfg)))
+    return 37 - sum(nums)
+
+def conf(m,e):
+    if m is None or e is None: return 0
+    return math.exp(-abs(m-e)/10)
+
+# ====== WORKER ======
+def worker(input_dir, output_dir, progress_var):
+    rows=[]
+    files=[]
+
+    for r,_,f in os.walk(input_dir):
+        for file in f:
+            if file.lower().endswith((".png",".jpg",".jpeg")):
+                files.append(os.path.join(r,file))
+
+    total=len(files)
+
+    for i,path in enumerate(files):
+        try:
+            vals=parse_image(path)
+            meta=metadata(path, os.path.basename(path))
+
+            exp=expected(meta["Config"])
+            c=conf(vals["S21_amp_avg"],exp)
+
+            q="OK" if c>0.9 else "CHECK" if c>0.7 else "BAD"
+
+            row={**meta,**vals,
+                 "Expected":exp,
+                 "Confidence":round(c,3),
+                 "Quality":q}
+
+            rows.append(row)
+            log(f"OK: {os.path.basename(path)}")
+
+        except Exception as e:
+            log(f"ERR: {path} -> {e}")
+
+        progress_var.set((i+1)/total*100)
+
+    df=pd.DataFrame(rows)
+    out=os.path.join(output_dir,"result.xlsx")
+    df.to_excel(out,index=False)
+
+    log("ГОТОВО")
+
+# ====== GUI ======
+class App:
+    def __init__(self,root):
+        self.root=root
+        self.root.title("Парсер ВАЦ")
+
+        self.input_dir=""
+        self.output_dir=""
+
+        tk.Button(root,text="Выбрать папку измерений",command=self.pick_input).pack(fill="x")
+        tk.Button(root,text="Выбрать папку сохранения",command=self.pick_output).pack(fill="x")
+        tk.Button(root,text="ЗАПУСТИТЬ",command=self.start).pack(fill="x")
+
+        self.progress=ttk.Progressbar(root, length=300)
+        self.progress.pack(fill="x")
+
+        self.progress_var=tk.DoubleVar()
+        self.progress.config(variable=self.progress_var)
+
+        self.log=tk.Text(root,height=20)
+        self.log.pack(fill="both",expand=True)
+
+        self.update_log()
+
+    def pick_input(self):
+        self.input_dir=filedialog.askdirectory()
+        log(f"Input: {self.input_dir}")
+
+    def pick_output(self):
+        self.output_dir=filedialog.askdirectory()
+        log(f"Output: {self.output_dir}")
+
+    def start(self):
+        if not self.input_dir or not self.output_dir:
+            messagebox.showerror("Ошибка","Выбери папки")
+            return
+
+        t=threading.Thread(target=worker,
+                           args=(self.input_dir,self.output_dir,self.progress_var),
+                           daemon=True)
+        t.start()
+
+    def update_log(self):
+        while not log_queue.empty():
+            msg=log_queue.get()
+            self.log.insert(tk.END,msg+"\n")
+            self.log.see(tk.END)
+        self.root.after(100,self.update_log)
+
+# ====== RUN ======
+root=tk.Tk()
+app=App(root)
+root.mainloop()
