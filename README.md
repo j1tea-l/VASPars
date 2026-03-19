@@ -42,6 +42,15 @@ winget install UB-Mannheim.TesseractOCR
 powershell -ExecutionPolicy Bypass -File .\deploy.ps1
 ```
 
+## Если деплой падает на `.venv\Scripts\python.exe`
+- Убедитесь, что установлен обычный Python с официального сайта (а не только alias из Microsoft Store).
+- Проверьте команды:
+  ```powershell
+  python --version
+  py -3 --version
+  ```
+- Если `python` не работает, но есть `py`, текущий `deploy.ps1` автоматически использует `py -3 -m venv .venv`.
+
 ## Структура файлов деплоя
 - `deploy.ps1` — автодеплой
 - `requirements.txt` — список Python-пакетов

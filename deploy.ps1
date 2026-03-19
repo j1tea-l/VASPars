@@ -6,23 +6,55 @@ $ErrorActionPreference = 'Stop'
 
 Set-Location $ProjectDir
 
+function New-Venv {
+    if (Test-Path ".venv") {
+        return
+    }
+
+    try {
+        python -m venv .venv
+    } catch {
+        $pyLauncher = Get-Command py -ErrorAction SilentlyContinue
+        if (-not $pyLauncher) {
+            throw "Failed to create .venv with 'python -m venv'. Python launcher 'py' is also unavailable."
+        }
+        & py -3 -m venv .venv
+    }
+}
+
+function Get-VenvPythonPath {
+    $candidates = @(
+        (Join-Path $ProjectDir ".venv\Scripts\python.exe"),
+        (Join-Path $ProjectDir ".venv\python.exe"),
+        (Join-Path $ProjectDir ".venv\bin\python"),
+        (Join-Path $ProjectDir ".venv\bin\python3")
+    )
+
+    foreach ($candidate in $candidates) {
+        if (Test-Path $candidate) {
+            return $candidate
+        }
+    }
+    return $null
+}
+
 Write-Host "[1/5] Checking Python..."
 $pythonCmd = Get-Command python -ErrorAction SilentlyContinue
-if (-not $pythonCmd) {
+$pyCmd = Get-Command py -ErrorAction SilentlyContinue
+if (-not $pythonCmd -and -not $pyCmd) {
     throw "Python is not found in PATH. Install Python 3.10+ and run the script again."
 }
 
 Write-Host "[2/5] Creating virtual environment..."
-if (-not (Test-Path ".venv")) {
-    python -m venv .venv
+New-Venv
+$venvPython = Get-VenvPythonPath
+if (-not $venvPython) {
+    throw "Virtual environment was created, but Python executable was not found in .venv."
 }
-
-$venvPython = Join-Path $ProjectDir ".venv\Scripts\python.exe"
-$venvPip = Join-Path $ProjectDir ".venv\Scripts\pip.exe"
 
 Write-Host "[3/5] Installing Python dependencies..."
 & $venvPython -m pip install --upgrade pip
-& $venvPip install -r requirements.txt
+& $venvPython -m pip install -r requirements.txt
 
 Write-Host "[4/5] Checking Tesseract OCR..."
 $tesseractCmd = Get-Command tesseract -ErrorAction SilentlyContinue
