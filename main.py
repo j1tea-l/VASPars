@@ -72,22 +72,43 @@ def parse_num(text):
         return None
     return float(nums[-1].replace(",", "."))
 
-def extract_from_lines(text, keys):
+def parse_nums(text):
+    return [float(n.replace(",", ".")) for n in NUM_RE.findall(text)]
+
+def in_range(val, value_range):
+    if value_range is None:
+        return val is not None
+    if val is None:
+        return False
+    lo, hi = value_range
+    return lo <= val <= hi
+
+def pick_number(candidates, value_range=None):
+    if not candidates:
+        return None
+    if value_range is None:
+        return candidates[-1]
+    for n in reversed(candidates):
+        if in_range(n, value_range):
+            return n
+    return None
+
+def extract_from_lines(text, keys, value_range=None):
     lines = text.split("\n")
     norm_keys = [normalize_token(k) for k in keys]
     for i, line in enumerate(lines):
         norm_line = normalize_token(line)
         if any(k in norm_line for k in norm_keys):
-            val = parse_num(line)
+            val = pick_number(parse_nums(line), value_range=value_range)
             if val is not None:
                 return val
             if i + 1 < len(lines):
-                val = parse_num(lines[i + 1])
+                val = pick_number(parse_nums(lines[i + 1]), value_range=value_range)
                 if val is not None:
                     return val
     return None
 
-def extract_from_layout(img, keys):
+def extract_from_layout(img, keys, value_range=None):
     data = pytesseract.image_to_data(
         img, config="--psm 6 -l rus+eng", output_type=pytesseract.Output.DICT
     )
@@ -121,6 +142,8 @@ def extract_from_layout(img, keys):
             num = parse_num(other["text"])
             if num is None:
                 continue
+            if not in_range(num, value_range):
+                continue
             dist = abs(other["left"] - x_right)
             candidates.append((dist, num))
         if candidates:
@@ -128,12 +151,12 @@ def extract_from_layout(img, keys):
             return candidates[0][1]
     return None
 
-def extract_metric(img, keys):
+def extract_metric(img, keys, value_range=None):
     text = ocr(img)
-    val = extract_from_lines(text, keys)
+    val = extract_from_lines(text, keys, value_range=value_range)
     if val is not None:
         return val
-    return extract_from_layout(img, keys)
+    return extract_from_layout(img, keys, value_range=value_range)
 
 def parse_image(path):
     img = read_image_unicode(path)
@@ -144,10 +167,10 @@ def parse_image(path):
     pre = {k: preprocess(v) for k, v in zones.items()}
 
     return {
-        "S21_amp_avg": extract_metric(pre["S21_amp"], ["сред", "сред:", "cpea", "cped"]),
-        "S21_gvz_uneven": extract_metric(pre["S21_gvz"], ["неравн", "неравн:", "нераен", "неревн"]),
-        "S11_avg": extract_metric(pre["S11"], ["сред", "сред:", "cpea", "cped"]),
-        "S22_avg": extract_metric(pre["S22"], ["сред", "сред:", "cpea", "cped"])
+        "S21_amp_avg": extract_metric(pre["S21_amp"], ["сред", "сред:", "cpea", "cped"], value_range=(-10, 60)),
+        "S21_gvz_uneven": extract_metric(pre["S21_gvz"], ["неравн", "неравн:", "нераен", "неревн"], value_range=(0, 20)),
+        "S11_avg": extract_metric(pre["S11"], ["сред", "сред:", "cpea", "cped"], value_range=(1.0, 3.5)),
+        "S22_avg": extract_metric(pre["S22"], ["сред", "сред:", "cpea", "cped"], value_range=(1.0, 3.5))
     }
 
 # ====== META ======
@@ -192,6 +215,16 @@ def conf(m,e):
     if m is None or e is None: return 0
     return math.exp(-abs(m-e)/10)
 
+def quality(vals, amp_conf):
+    s11_ok = in_range(vals.get("S11_avg"), (1.0, 3.5))
+    s22_ok = in_range(vals.get("S22_avg"), (1.0, 3.5))
+
+    if amp_conf > 0.9 and s11_ok and s22_ok:
+        return "OK"
+    if amp_conf > 0.7 and (s11_ok or s22_ok):
+        return "CHECK"
+    return "BAD"
+
 # ====== WORKER ======
 def worker(input_dir, output_dir, progress_var):
     rows=[]
@@ -211,8 +244,7 @@ def worker(input_dir, output_dir, progress_var):
 
             exp=expected(meta["Config"])
             c=conf(vals["S21_amp_avg"],exp)
-
-            q="OK" if c>0.9 else "CHECK" if c>0.7 else "BAD"
+            q=quality(vals, c)
 
             row={**meta,**vals,
                  "Expected":exp,
