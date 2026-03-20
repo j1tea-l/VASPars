@@ -11,6 +11,7 @@ import pytesseract
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 import openpyxl
+from openpyxl.drawing.image import Image as XLImage
 # ====== TESSERACT ======
 DEFAULT_TESSERACT = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 if os.path.exists(DEFAULT_TESSERACT):
@@ -44,6 +45,14 @@ def preprocess(img):
 
     return th
 
+def preprocess_soft(img):
+    h, w = img.shape[:2]
+    scale = max(1.3, 2200 / min(h, w))
+    img = cv2.resize(img, None, fx=scale, fy=scale)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    _, th = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY_INV)
+    return th
+
 def split_4(img):
     h, w = img.shape[:2]
     return {
@@ -62,7 +71,11 @@ S11_RANGE = (1.0, 2.0)
 S22_RANGE = (1.0, 2.0)
 RX_ALLOWED_LEVELS = [40, 25, 10, -5, -20]
 RX_TOLERANCE_DB = 4
+TX_ALLOWED_LEVELS = [0, -15, -30]
+TX_TOLERANCE_DB = 4
 MAX_WORKERS = max(1, min(8, (os.cpu_count() or 1)))
+RX_BANDS = {1: "1025-1525", 2: "975-1475", 3: "1076-1576"}
+TX_BANDS = {1: "1000-1500", 2: "850-1350", 3: "1400-1900", 4: "1500-2000"}
 
 def normalize_token(token):
     token = token.lower()
@@ -171,12 +184,20 @@ def parse_image(path):
     # Подготавливаем каждую зону отдельно, чтобы устойчиво работать
     # при "плавающей" области с текстовыми значениями.
     pre = {k: preprocess(v) for k, v in zones.items()}
+    pre_soft = {k: preprocess_soft(v) for k, v in zones.items()}
+
+    def metric_with_recovery(zone_name, keys, value_range):
+        primary = extract_metric(pre[zone_name], keys, value_range=value_range)
+        if primary is not None:
+            return primary
+        return extract_metric(pre_soft[zone_name], keys, value_range=value_range)
 
     return {
-        "S21_amp_avg": extract_metric(pre["S21_amp"], ["сред", "сред:", "cpea", "cped"], value_range=(-10, 60)),
-        "S21_gvz_uneven": extract_metric(pre["S21_gvz"], ["неравн", "неравн:", "нераен", "неревн"], value_range=(0, 20)),
-        "S11_avg": extract_metric(pre["S11"], ["сред", "сред:", "cpea", "cped"], value_range=S11_RANGE),
-        "S22_avg": extract_metric(pre["S22"], ["сред", "сред:", "cpea", "cped"], value_range=S22_RANGE)
+        "S21_amp_avg": metric_with_recovery("S21_amp", ["усил", "усип", "сред", "сред:", "cpea", "cped"], value_range=(-20, 45)),
+        "S21_amp_uneven": metric_with_recovery("S21_amp", ["неравн", "неравн:", "нераен", "неревн"], value_range=(0.0, 6.5)),
+        "S21_gvz_uneven": metric_with_recovery("S21_gvz", ["неравн", "неравн:", "нераен", "неревн"], value_range=(0, 20)),
+        "S11_avg": metric_with_recovery("S11", ["сред", "сред:", "cpea", "cped"], value_range=S11_RANGE),
+        "S22_avg": metric_with_recovery("S22", ["сред", "сред:", "cpea", "cped"], value_range=S22_RANGE)
     }
 
 # ====== META ======
@@ -192,6 +213,16 @@ def detect_channel(n):
     if "рез" in n or "reserve" in n: return "Reserve"
     return None
 
+def detect_channel_no(name):
+    name = name.lower()
+    p = re.search(r"(?:канал\D*)(\d+)", name)
+    if p:
+        return int(p.group(1))
+    p = re.search(r"\b(\d+)\s*канал", name)
+    if p:
+        return int(p.group(1))
+    return None
+
 def detect_att(n):
     nums = re.findall(r"\b(0|15|30)\b", n)
     if len(nums)==1: return f"ATT{nums[0]}"
@@ -203,12 +234,16 @@ def detect_band(n):
     return f"{m.group(1)}-{m.group(2)}" if m else None
 
 def metadata(path,file):
+    p = detect_path(path)
+    ch_no = detect_channel_no(file)
+    mapped_band = RX_BANDS.get(ch_no) if p == "Rx" else TX_BANDS.get(ch_no) if p == "Tx" else None
     return {
         "Device": os.path.basename(os.path.dirname(os.path.dirname(path))),
         "Channel": detect_channel(file),
-        "Path": detect_path(path),
+        "ChannelNo": ch_no,
+        "Path": p,
         "Config": detect_att(file),
-        "Band": detect_band(file)
+        "Band": mapped_band or detect_band(file)
     }
 
 # ====== PHYSICS ======
@@ -221,20 +256,56 @@ def conf(m,e):
     if m is None or e is None: return 0
     return math.exp(-abs(m-e)/10)
 
+def conf_with_tol(measured, target, tol_db):
+    if measured is None or target is None:
+        return 0
+    return max(0.0, 1 - abs(measured - target) / tol_db)
+
+def conf_with_asym_tol(measured, target, minus_tol, plus_tol):
+    if measured is None:
+        return 0
+    low = target + minus_tol
+    high = target + plus_tol
+    if low <= measured <= high:
+        return 1.0
+    if measured < low:
+        d = low - measured
+        span = max(0.001, abs(minus_tol))
+        return max(0.0, 1 - d / span)
+    d = measured - high
+    span = max(0.001, abs(plus_tol))
+    return max(0.0, 1 - d / span)
+
 def conf_rx(m):
     if m is None:
         return 0
-    d = min(abs(m - ref) for ref in RX_ALLOWED_LEVELS)
-    return max(0.0, 1 - d / RX_TOLERANCE_DB)
+    nearest = min(RX_ALLOWED_LEVELS, key=lambda x: abs(m - x))
+    return conf_with_tol(m, nearest, RX_TOLERANCE_DB)
+
+def tx_target_from_config(cfg):
+    if not cfg:
+        return None
+    vals = list(map(int, re.findall(r"\d+", cfg)))
+    if not vals:
+        return None
+    total = -sum(vals)
+    return min(TX_ALLOWED_LEVELS, key=lambda x: abs(x - total))
 
 def expected_for_meta(meta):
-    if meta.get("Path") == "Rx":
+    path = meta.get("Path")
+    if path == "Rx":
         return None
+    if path == "Tx":
+        return tx_target_from_config(meta.get("Config"))
     return expected(meta.get("Config"))
 
 def confidence_for_meta(meta, s21_amp):
-    if meta.get("Path") == "Rx":
+    path = meta.get("Path")
+    if path == "Rx":
         return conf_rx(s21_amp)
+    if path == "Tx":
+        target = tx_target_from_config(meta.get("Config"))
+        return conf_with_tol(s21_amp, target, TX_TOLERANCE_DB)
     return conf(s21_amp, expected(meta.get("Config")))
 
 def quality(vals, amp_conf):
@@ -252,13 +323,87 @@ def process_file(path):
     meta = metadata(path, os.path.basename(path))
     exp = expected_for_meta(meta)
     c = confidence_for_meta(meta, vals["S21_amp_avg"])
+    c_uneven = conf_with_asym_tol(vals.get("S21_amp_uneven"), 1.0, minus_tol=-0.8, plus_tol=5.0)
     q = quality(vals, c)
     return {
         **meta, **vals,
+        "SourceImage": path,
         "Expected": exp,
         "Confidence": round(c, 3),
+        "S21_amp_uneven_conf": round(c_uneven, 3),
         "Quality": q
     }
+
+def write_report(rows, output_path):
+    wb = openpyxl.Workbook()
+    wb.remove(wb.active)
+
+    grouped = {}
+    for row in rows:
+        grouped.setdefault(row["Device"], []).append(row)
+
+    headers = ["Preview", "Device", "Path", "Band", "Channel", "ChannelNo", "Config",
+               "S21_amp_avg", "S21_amp_uneven", "S21_amp_uneven_conf", "S21_gvz_uneven",
+               "S11_avg", "S22_avg", "Expected", "Confidence", "Quality"]
+
+    for device, items in grouped.items():
+        ws = wb.create_sheet(title=str(device)[:31] if device else "Unknown")
+        ws.append([f"Device: {device}"])
+        ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(headers))
+        row_idx = 3
+
+        for path_group in ("Rx", "Tx"):
+            subset = [x for x in items if x.get("Path") == path_group]
+            if not subset:
+                continue
+            ws.cell(row=row_idx, column=1, value=path_group)
+            row_idx += 1
+            subset.sort(key=lambda x: (str(x.get("Band") or ""), str(x.get("ChannelNo") or "")))
+            band_groups = {}
+            for it in subset:
+                band_groups.setdefault(it.get("Band") or "Unknown", []).append(it)
+
+            for band, band_items in band_groups.items():
+                ws.cell(row=row_idx, column=1, value=f"Band {band}")
+                row_idx += 1
+                for c_idx, h in enumerate(headers, start=1):
+                    ws.cell(row=row_idx, column=c_idx, value=h)
+                row_idx += 1
+
+                for it in band_items:
+                    ws.row_dimensions[row_idx].height = 140
+                    ws.cell(row=row_idx, column=2, value=it.get("Device"))
+                    ws.cell(row=row_idx, column=3, value=it.get("Path"))
+                    ws.cell(row=row_idx, column=4, value=it.get("Band"))
+                    ws.cell(row=row_idx, column=5, value=it.get("Channel"))
+                    ws.cell(row=row_idx, column=6, value=it.get("ChannelNo"))
+                    ws.cell(row=row_idx, column=7, value=it.get("Config"))
+                    ws.cell(row=row_idx, column=8, value=it.get("S21_amp_avg"))
+                    ws.cell(row=row_idx, column=9, value=it.get("S21_amp_uneven"))
+                    ws.cell(row=row_idx, column=10, value=it.get("S21_amp_uneven_conf"))
+                    ws.cell(row=row_idx, column=11, value=it.get("S21_gvz_uneven"))
+                    ws.cell(row=row_idx, column=12, value=it.get("S11_avg"))
+                    ws.cell(row=row_idx, column=13, value=it.get("S22_avg"))
+                    ws.cell(row=row_idx, column=14, value=it.get("Expected"))
+                    ws.cell(row=row_idx, column=15, value=it.get("Confidence"))
+                    ws.cell(row=row_idx, column=16, value=it.get("Quality"))
+
+                    img_path = it.get("SourceImage")
+                    if img_path and os.path.exists(img_path):
+                        try:
+                            img = XLImage(img_path)
+                            img.width = 250
+                            img.height = 140
+                            ws.add_image(img, f"A{row_idx}")
+                        except Exception:
+                            ws.cell(row=row_idx, column=1, value=img_path)
+                    row_idx += 1
+                row_idx += 1
+
+        for col in ("A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P"):
+            ws.column_dimensions[col].width = 18 if col != "A" else 36
+
+    wb.save(output_path)
 
 # ====== WORKER ======
 def worker(input_dir, output_dir, progress_var):
@@ -289,9 +434,8 @@ def worker(input_dir, output_dir, progress_var):
             done += 1
             progress_var.set(done/total*100)
 
-    df=pd.DataFrame(rows)
-    out=os.path.join(output_dir,"result.xlsx")
-    df.to_excel(out,index=False)
+    out=os.path.join(output_dir,"results.xlsx")
+    write_report(rows, out)
 
     log("ГОТОВО")
 
