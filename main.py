@@ -4,6 +4,7 @@ import cv2
 import math
 import queue
 import threading
+import concurrent.futures
 import numpy as np
 import pandas as pd
 import pytesseract
@@ -11,7 +12,9 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 import openpyxl
 # ====== TESSERACT ======
-pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+DEFAULT_TESSERACT = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+if os.path.exists(DEFAULT_TESSERACT):
+    pytesseract.pytesseract.tesseract_cmd = DEFAULT_TESSERACT
 
 # ====== QUEUE ======
 log_queue = queue.Queue()
@@ -54,29 +57,126 @@ def split_4(img):
 def ocr(img):
     return pytesseract.image_to_string(img, config="--psm 6 -l rus+eng").lower()
 
-def extract(text, keys):
-    lines = text.split("\n")
-    for i, line in enumerate(lines):
-        for k in keys:
-            if k in line:
-                nums = re.findall(r"[-+]?\d+[.,]?\d*", line)
-                if nums:
-                    return float(nums[-1].replace(",", "."))
-                if i+1 < len(lines):
-                    nums = re.findall(r"[-+]?\d+[.,]?\d*", lines[i+1])
-                    if nums:
-                        return float(nums[0].replace(",", "."))
+NUM_RE = re.compile(r"[-+]?\d+[.,]?\d*")
+S11_RANGE = (1.0, 2.0)
+S22_RANGE = (1.0, 2.0)
+RX_ALLOWED_LEVELS = [40, 25, 10, -5, -20]
+RX_TOLERANCE_DB = 4
+MAX_WORKERS = max(1, min(8, (os.cpu_count() or 1)))
+
+def normalize_token(token):
+    token = token.lower()
+    translit = str.maketrans({
+        "a": "а", "c": "с", "e": "е", "k": "к", "m": "м", "h": "н", "o": "о", "p": "р", "t": "т", "x": "х",
+        "y": "у", "b": "в", "n": "п"
+    })
+    return token.translate(translit)
+
+def parse_num(text):
+    nums = NUM_RE.findall(text)
+    if not nums:
+        return None
+    return float(nums[-1].replace(",", "."))
+
+def parse_nums(text):
+    return [float(n.replace(",", ".")) for n in NUM_RE.findall(text)]
+
+def in_range(val, value_range):
+    if value_range is None:
+        return val is not None
+    if val is None:
+        return False
+    lo, hi = value_range
+    return lo <= val <= hi
+
+def pick_number(candidates, value_range=None):
+    if not candidates:
+        return None
+    if value_range is None:
+        return candidates[-1]
+    for n in reversed(candidates):
+        if in_range(n, value_range):
+            return n
     return None
+
+def extract_from_lines(text, keys, value_range=None):
+    lines = text.split("\n")
+    norm_keys = [normalize_token(k) for k in keys]
+    for i, line in enumerate(lines):
+        norm_line = normalize_token(line)
+        if any(k in norm_line for k in norm_keys):
+            val = pick_number(parse_nums(line), value_range=value_range)
+            if val is not None:
+                return val
+            if i + 1 < len(lines):
+                val = pick_number(parse_nums(lines[i + 1]), value_range=value_range)
+                if val is not None:
+                    return val
+    return None
+
+def extract_from_layout(img, keys, value_range=None):
+    data = pytesseract.image_to_data(
+        img, config="--psm 6 -l rus+eng", output_type=pytesseract.Output.DICT
+    )
+    norm_keys = [normalize_token(k) for k in keys]
+    tokens = []
+    for i, raw in enumerate(data["text"]):
+        text = raw.strip()
+        conf = int(data["conf"][i]) if str(data["conf"][i]).lstrip("-").isdigit() else -1
+        if not text or conf < 0:
+            continue
+        tokens.append({
+            "text": text,
+            "norm": normalize_token(text),
+            "left": data["left"][i],
+            "top": data["top"][i],
+            "width": data["width"][i],
+            "height": data["height"][i],
+        })
+
+    for tk in tokens:
+        if not any(k in tk["norm"] for k in norm_keys):
+            continue
+        y = tk["top"]
+        x_right = tk["left"] + tk["width"]
+        candidates = []
+        for other in tokens:
+            if abs(other["top"] - y) > max(tk["height"], other["height"]) * 1.6:
+                continue
+            if other["left"] + other["width"] < x_right - 5:
+                continue
+            num = parse_num(other["text"])
+            if num is None:
+                continue
+            if not in_range(num, value_range):
+                continue
+            dist = abs(other["left"] - x_right)
+            candidates.append((dist, num))
+        if candidates:
+            candidates.sort(key=lambda item: item[0])
+            return candidates[0][1]
+    return None
+
+def extract_metric(img, keys, value_range=None):
+    text = ocr(img)
+    val = extract_from_lines(text, keys, value_range=value_range)
+    if val is not None:
+        return val
+    return extract_from_layout(img, keys, value_range=value_range)
 
 def parse_image(path):
     img = read_image_unicode(path)
     zones = split_4(img)
 
+    # Подготавливаем каждую зону отдельно, чтобы устойчиво работать
+    # при "плавающей" области с текстовыми значениями.
+    pre = {k: preprocess(v) for k, v in zones.items()}
+
     return {
-        "S21_amp_avg": extract(ocr(preprocess(zones["S21_amp"])), ["сред","cpea"]),
-        "S21_gvz_uneven": extract(ocr(preprocess(zones["S21_gvz"])), ["неравн","нераен"]),
-        "S11_avg": extract(ocr(preprocess(zones["S11"])), ["сред","cpea"]),
-        "S22_avg": extract(ocr(preprocess(zones["S22"])), ["сред","cpea"])
+        "S21_amp_avg": extract_metric(pre["S21_amp"], ["сред", "сред:", "cpea", "cped"], value_range=(-10, 60)),
+        "S21_gvz_uneven": extract_metric(pre["S21_gvz"], ["неравн", "неравн:", "нераен", "неревн"], value_range=(0, 20)),
+        "S11_avg": extract_metric(pre["S11"], ["сред", "сред:", "cpea", "cped"], value_range=S11_RANGE),
+        "S22_avg": extract_metric(pre["S22"], ["сред", "сред:", "cpea", "cped"], value_range=S22_RANGE)
     }
 
 # ====== META ======
@@ -121,6 +221,45 @@ def conf(m,e):
     if m is None or e is None: return 0
     return math.exp(-abs(m-e)/10)
 
+def conf_rx(m):
+    if m is None:
+        return 0
+    d = min(abs(m - ref) for ref in RX_ALLOWED_LEVELS)
+    return max(0.0, 1 - d / RX_TOLERANCE_DB)
+
+def expected_for_meta(meta):
+    if meta.get("Path") == "Rx":
+        return None
+    return expected(meta.get("Config"))
+
+def confidence_for_meta(meta, s21_amp):
+    if meta.get("Path") == "Rx":
+        return conf_rx(s21_amp)
+    return conf(s21_amp, expected(meta.get("Config")))
+
+def quality(vals, amp_conf):
+    s11_ok = in_range(vals.get("S11_avg"), S11_RANGE)
+    s22_ok = in_range(vals.get("S22_avg"), S22_RANGE)
+
+    if amp_conf > 0.9 and s11_ok and s22_ok:
+        return "OK"
+    if amp_conf > 0.7 and (s11_ok or s22_ok):
+        return "CHECK"
+    return "BAD"
+
+def process_file(path):
+    vals = parse_image(path)
+    meta = metadata(path, os.path.basename(path))
+    exp = expected_for_meta(meta)
+    c = confidence_for_meta(meta, vals["S21_amp_avg"])
+    q = quality(vals, c)
+    return {
+        **meta, **vals,
+        "Expected": exp,
+        "Confidence": round(c, 3),
+        "Quality": q
+    }
+
 # ====== WORKER ======
 def worker(input_dir, output_dir, progress_var):
     rows=[]
@@ -132,29 +271,23 @@ def worker(input_dir, output_dir, progress_var):
                 files.append(os.path.join(r,file))
 
     total=len(files)
+    if total == 0:
+        log("Нет файлов изображений для обработки")
+        return
 
-    for i,path in enumerate(files):
-        try:
-            vals=parse_image(path)
-            meta=metadata(path, os.path.basename(path))
+    done = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        future_map = {ex.submit(process_file, path): path for path in files}
 
-            exp=expected(meta["Config"])
-            c=conf(vals["S21_amp_avg"],exp)
-
-            q="OK" if c>0.9 else "CHECK" if c>0.7 else "BAD"
-
-            row={**meta,**vals,
-                 "Expected":exp,
-                 "Confidence":round(c,3),
-                 "Quality":q}
-
-            rows.append(row)
-            log(f"OK: {os.path.basename(path)}")
-
-        except Exception as e:
-            log(f"ERR: {path} -> {e}")
-
-        progress_var.set((i+1)/total*100)
+        for future in concurrent.futures.as_completed(future_map):
+            path = future_map[future]
+            try:
+                rows.append(future.result())
+                log(f"OK: {os.path.basename(path)}")
+            except Exception as e:
+                log(f"ERR: {path} -> {e}")
+            done += 1
+            progress_var.set(done/total*100)
 
     df=pd.DataFrame(rows)
     out=os.path.join(output_dir,"result.xlsx")
