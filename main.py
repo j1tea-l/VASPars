@@ -4,6 +4,7 @@ import cv2
 import math
 import queue
 import threading
+import concurrent.futures
 import numpy as np
 import pandas as pd
 import pytesseract
@@ -57,6 +58,11 @@ def ocr(img):
     return pytesseract.image_to_string(img, config="--psm 6 -l rus+eng").lower()
 
 NUM_RE = re.compile(r"[-+]?\d+[.,]?\d*")
+S11_RANGE = (1.0, 2.0)
+S22_RANGE = (1.0, 2.0)
+RX_ALLOWED_LEVELS = [40, 25, 10, -5, -20]
+RX_TOLERANCE_DB = 4
+MAX_WORKERS = max(1, min(8, (os.cpu_count() or 1)))
 
 def normalize_token(token):
     token = token.lower()
@@ -169,8 +175,8 @@ def parse_image(path):
     return {
         "S21_amp_avg": extract_metric(pre["S21_amp"], ["сред", "сред:", "cpea", "cped"], value_range=(-10, 60)),
         "S21_gvz_uneven": extract_metric(pre["S21_gvz"], ["неравн", "неравн:", "нераен", "неревн"], value_range=(0, 20)),
-        "S11_avg": extract_metric(pre["S11"], ["сред", "сред:", "cpea", "cped"], value_range=(1.0, 3.5)),
-        "S22_avg": extract_metric(pre["S22"], ["сред", "сред:", "cpea", "cped"], value_range=(1.0, 3.5))
+        "S11_avg": extract_metric(pre["S11"], ["сред", "сред:", "cpea", "cped"], value_range=S11_RANGE),
+        "S22_avg": extract_metric(pre["S22"], ["сред", "сред:", "cpea", "cped"], value_range=S22_RANGE)
     }
 
 # ====== META ======
@@ -215,15 +221,44 @@ def conf(m,e):
     if m is None or e is None: return 0
     return math.exp(-abs(m-e)/10)
 
+def conf_rx(m):
+    if m is None:
+        return 0
+    d = min(abs(m - ref) for ref in RX_ALLOWED_LEVELS)
+    return max(0.0, 1 - d / RX_TOLERANCE_DB)
+
+def expected_for_meta(meta):
+    if meta.get("Path") == "Rx":
+        return None
+    return expected(meta.get("Config"))
+
+def confidence_for_meta(meta, s21_amp):
+    if meta.get("Path") == "Rx":
+        return conf_rx(s21_amp)
+    return conf(s21_amp, expected(meta.get("Config")))
+
 def quality(vals, amp_conf):
-    s11_ok = in_range(vals.get("S11_avg"), (1.0, 3.5))
-    s22_ok = in_range(vals.get("S22_avg"), (1.0, 3.5))
+    s11_ok = in_range(vals.get("S11_avg"), S11_RANGE)
+    s22_ok = in_range(vals.get("S22_avg"), S22_RANGE)
 
     if amp_conf > 0.9 and s11_ok and s22_ok:
         return "OK"
     if amp_conf > 0.7 and (s11_ok or s22_ok):
         return "CHECK"
     return "BAD"
+
+def process_file(path):
+    vals = parse_image(path)
+    meta = metadata(path, os.path.basename(path))
+    exp = expected_for_meta(meta)
+    c = confidence_for_meta(meta, vals["S21_amp_avg"])
+    q = quality(vals, c)
+    return {
+        **meta, **vals,
+        "Expected": exp,
+        "Confidence": round(c, 3),
+        "Quality": q
+    }
 
 # ====== WORKER ======
 def worker(input_dir, output_dir, progress_var):
@@ -236,28 +271,23 @@ def worker(input_dir, output_dir, progress_var):
                 files.append(os.path.join(r,file))
 
     total=len(files)
+    if total == 0:
+        log("Нет файлов изображений для обработки")
+        return
 
-    for i,path in enumerate(files):
-        try:
-            vals=parse_image(path)
-            meta=metadata(path, os.path.basename(path))
+    done = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        future_map = {ex.submit(process_file, path): path for path in files}
 
-            exp=expected(meta["Config"])
-            c=conf(vals["S21_amp_avg"],exp)
-            q=quality(vals, c)
-
-            row={**meta,**vals,
-                 "Expected":exp,
-                 "Confidence":round(c,3),
-                 "Quality":q}
-
-            rows.append(row)
-            log(f"OK: {os.path.basename(path)}")
-
-        except Exception as e:
-            log(f"ERR: {path} -> {e}")
-
-        progress_var.set((i+1)/total*100)
+        for future in concurrent.futures.as_completed(future_map):
+            path = future_map[future]
+            try:
+                rows.append(future.result())
+                log(f"OK: {os.path.basename(path)}")
+            except Exception as e:
+                log(f"ERR: {path} -> {e}")
+            done += 1
+            progress_var.set(done/total*100)
 
     df=pd.DataFrame(rows)
     out=os.path.join(output_dir,"result.xlsx")
