@@ -192,10 +192,16 @@ def parse_image(path):
             return primary
         return extract_metric(pre_soft[zone_name], keys, value_range=value_range)
 
+    s21_gvz_uneven = metric_with_recovery("S21_gvz", ["неравн", "неравн:", "нераен", "неревн"], value_range=(0, 500))
+    # На TX значение часто в пс (пикосекундах), OCR обычно читает только число.
+    # Если получили большое число, интерпретируем его как пс и переводим в нс.
+    if s21_gvz_uneven is not None and s21_gvz_uneven > 20:
+        s21_gvz_uneven = s21_gvz_uneven / 1000.0
+
     return {
         "S21_amp_avg": metric_with_recovery("S21_amp", ["усил", "усип", "сред", "сред:", "cpea", "cped"], value_range=(-20, 45)),
         "S21_amp_uneven": metric_with_recovery("S21_amp", ["неравн", "неравн:", "нераен", "неревн"], value_range=(0.0, 6.5)),
-        "S21_gvz_uneven": metric_with_recovery("S21_gvz", ["неравн", "неравн:", "нераен", "неревн"], value_range=(0, 20)),
+        "S21_gvz_uneven": s21_gvz_uneven,
         "S11_avg": metric_with_recovery("S11", ["сред", "сред:", "cpea", "cped"], value_range=S11_RANGE),
         "S22_avg": metric_with_recovery("S22", ["сред", "сред:", "cpea", "cped"], value_range=S22_RANGE)
     }
@@ -215,10 +221,10 @@ def detect_channel(n):
 
 def detect_channel_no(name):
     name = name.lower()
-    p = re.search(r"(?:канал\D*)(\d+)", name)
+    p = re.search(r"\b(\d+)\s*канал\b", name)
     if p:
         return int(p.group(1))
-    p = re.search(r"\b(\d+)\s*канал", name)
+    p = re.search(r"(?:канал\D+)(\d+)", name)
     if p:
         return int(p.group(1))
     return None
