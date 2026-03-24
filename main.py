@@ -237,13 +237,16 @@ def metadata(path,file):
     p = detect_path(path)
     ch_no = detect_channel_no(file)
     mapped_band = RX_BANDS.get(ch_no) if p == "Rx" else TX_BANDS.get(ch_no) if p == "Tx" else None
+    band_value = mapped_band or detect_band(file)
+    if band_value and "мгц" not in str(band_value).lower():
+        band_value = f"{band_value} МГц"
     return {
         "Device": os.path.basename(os.path.dirname(os.path.dirname(path))),
         "Channel": detect_channel(file),
         "ChannelNo": ch_no,
         "Path": p,
         "Config": detect_att(file),
-        "Band": mapped_band or detect_band(file)
+        "Band": band_value
     }
 
 # ====== PHYSICS ======
@@ -308,29 +311,62 @@ def confidence_for_meta(meta, s21_amp):
         return conf_with_tol(s21_amp, target, TX_TOLERANCE_DB)
     return conf(s21_amp, expected(meta.get("Config")))
 
-def quality(vals, amp_conf):
-    s11_ok = in_range(vals.get("S11_avg"), S11_RANGE)
-    s22_ok = in_range(vals.get("S22_avg"), S22_RANGE)
-
-    if amp_conf > 0.9 and s11_ok and s22_ok:
+def metric_status_from_range(value, lo, hi):
+    if value is None:
+        return "BAD"
+    if lo <= value <= hi:
         return "OK"
-    if amp_conf > 0.7 and (s11_ok or s22_ok):
+    span = max(0.001, hi - lo)
+    dist = min(abs(value - lo), abs(value - hi))
+    if dist <= span * 0.5:
         return "CHECK"
     return "BAD"
+
+def amp_status(meta, s21_amp):
+    path = meta.get("Path")
+    if s21_amp is None:
+        return "BAD"
+    if path == "Rx":
+        nearest = min(RX_ALLOWED_LEVELS, key=lambda x: abs(x - s21_amp))
+        d = abs(s21_amp - nearest)
+        if d <= RX_TOLERANCE_DB:
+            return "OK"
+        if d <= RX_TOLERANCE_DB * 2:
+            return "CHECK"
+        return "BAD"
+    if path == "Tx":
+        target = tx_target_from_config(meta.get("Config"))
+        if target is None:
+            return "BAD"
+        d = abs(s21_amp - target)
+        if d <= TX_TOLERANCE_DB:
+            return "OK"
+        if d <= TX_TOLERANCE_DB * 2:
+            return "CHECK"
+        return "BAD"
+    return "CHECK"
+
+def quality(meta, vals):
+    statuses = [
+        amp_status(meta, vals.get("S21_amp_avg")),
+        metric_status_from_range(vals.get("S21_amp_uneven"), 0.2, 6.0),
+        metric_status_from_range(vals.get("S21_gvz_uneven"), 0.0, 20.0),
+        metric_status_from_range(vals.get("S11_avg"), S11_RANGE[0], S11_RANGE[1]),
+        metric_status_from_range(vals.get("S22_avg"), S22_RANGE[0], S22_RANGE[1]),
+    ]
+    if "BAD" in statuses:
+        return "BAD"
+    if "CHECK" in statuses:
+        return "CHECK"
+    return "OK"
 
 def process_file(path):
     vals = parse_image(path)
     meta = metadata(path, os.path.basename(path))
-    exp = expected_for_meta(meta)
-    c = confidence_for_meta(meta, vals["S21_amp_avg"])
-    c_uneven = conf_with_asym_tol(vals.get("S21_amp_uneven"), 1.0, minus_tol=-0.8, plus_tol=5.0)
-    q = quality(vals, c)
+    q = quality(meta, vals)
     return {
         **meta, **vals,
         "SourceImage": path,
-        "Expected": exp,
-        "Confidence": round(c, 3),
-        "S21_amp_uneven_conf": round(c_uneven, 3),
         "Quality": q
     }
 
@@ -342,9 +378,8 @@ def write_report(rows, output_path):
     for row in rows:
         grouped.setdefault(row["Device"], []).append(row)
 
-    headers = ["Preview", "Device", "Path", "Band", "Channel", "ChannelNo", "Config",
-               "S21_amp_avg", "S21_amp_uneven", "S21_amp_uneven_conf", "S21_gvz_uneven",
-               "S11_avg", "S22_avg", "Expected", "Confidence", "Quality"]
+    headers = ["Preview", "S21_amp_avg", "S21_amp_uneven", "S21_gvz_uneven", "S11_avg", "S22_avg",
+               "Quality", "Path", "Band", "Channel", "ChannelNo", "Config", "Device"]
 
     for device, items in grouped.items():
         ws = wb.create_sheet(title=str(device)[:31] if device else "Unknown")
@@ -372,21 +407,18 @@ def write_report(rows, output_path):
 
                 for it in band_items:
                     ws.row_dimensions[row_idx].height = 140
-                    ws.cell(row=row_idx, column=2, value=it.get("Device"))
-                    ws.cell(row=row_idx, column=3, value=it.get("Path"))
-                    ws.cell(row=row_idx, column=4, value=it.get("Band"))
-                    ws.cell(row=row_idx, column=5, value=it.get("Channel"))
-                    ws.cell(row=row_idx, column=6, value=it.get("ChannelNo"))
-                    ws.cell(row=row_idx, column=7, value=it.get("Config"))
-                    ws.cell(row=row_idx, column=8, value=it.get("S21_amp_avg"))
-                    ws.cell(row=row_idx, column=9, value=it.get("S21_amp_uneven"))
-                    ws.cell(row=row_idx, column=10, value=it.get("S21_amp_uneven_conf"))
-                    ws.cell(row=row_idx, column=11, value=it.get("S21_gvz_uneven"))
-                    ws.cell(row=row_idx, column=12, value=it.get("S11_avg"))
-                    ws.cell(row=row_idx, column=13, value=it.get("S22_avg"))
-                    ws.cell(row=row_idx, column=14, value=it.get("Expected"))
-                    ws.cell(row=row_idx, column=15, value=it.get("Confidence"))
-                    ws.cell(row=row_idx, column=16, value=it.get("Quality"))
+                    ws.cell(row=row_idx, column=2, value=it.get("S21_amp_avg"))
+                    ws.cell(row=row_idx, column=3, value=it.get("S21_amp_uneven"))
+                    ws.cell(row=row_idx, column=4, value=it.get("S21_gvz_uneven"))
+                    ws.cell(row=row_idx, column=5, value=it.get("S11_avg"))
+                    ws.cell(row=row_idx, column=6, value=it.get("S22_avg"))
+                    ws.cell(row=row_idx, column=7, value=it.get("Quality"))
+                    ws.cell(row=row_idx, column=8, value=it.get("Path"))
+                    ws.cell(row=row_idx, column=9, value=it.get("Band"))
+                    ws.cell(row=row_idx, column=10, value=it.get("Channel"))
+                    ws.cell(row=row_idx, column=11, value=it.get("ChannelNo"))
+                    ws.cell(row=row_idx, column=12, value=it.get("Config"))
+                    ws.cell(row=row_idx, column=13, value=it.get("Device"))
 
                     img_path = it.get("SourceImage")
                     if img_path and os.path.exists(img_path):
@@ -400,7 +432,7 @@ def write_report(rows, output_path):
                     row_idx += 1
                 row_idx += 1
 
-        for col in ("A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P"):
+        for col in ("A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M"):
             ws.column_dimensions[col].width = 18 if col != "A" else 36
 
     wb.save(output_path)
